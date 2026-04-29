@@ -5,16 +5,7 @@ yarn-debug.log*
 yarn-error.log*
 coverage/
 
-# Terraform folders and state
-# These contain sensitive info and large provider binaries
 .terraform/
 *.tfstate
-*.tfstate.backup
-.terraform.lock.hcl
-
-# MacOS/Windows system files
-.DS_Store
-Thumbs.db
-
-# Optional: Ignore environment variables if you create a .env file
-.env
+*.tfstate.*
+terraform.tfvars
