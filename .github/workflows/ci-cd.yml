@@ -1,0 +1,156 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Required for OIDC — allows GitHub to get a token from AWS
+permissions:
+  id-token: write
+  contents: read
+
+# Change these 4 values to match your actual AWS resources
+# Get them by running: terraform output
+env:
+  AWS_REGION:    us-east-1
+  ECR_REPO:      cicd-demo-dev               # terraform output ecr_repository_url (last part after /)
+  ECS_CLUSTER:   cicd-demo-dev-cluster       # terraform output ecs_cluster_name
+  ECS_SERVICE:   cicd-demo-dev-service       # terraform output ecs_service_name
+  IMAGE_TAG:     ${{ github.sha }}           # unique tag per commit — never overwrite latest
+
+jobs:
+
+  ##############################################
+  # JOB 1 — Test + SonarCloud quality gate
+  ##############################################
+  test:
+    name: Test and scan
+    runs-on: ubuntu-latest
+    steps:
+
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0     # SonarCloud needs full history
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run tests with coverage
+        run: npm test
+
+      - name: SonarCloud scan
+        uses: SonarSource/sonarcloud-github-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}   # automatic — no setup needed
+          SONAR_TOKEN:  ${{ secrets.SONAR_TOKEN }}    # the token you added in GitHub secrets
+
+  ##############################################
+  # JOB 2 — Build Docker image and push to ECR
+  # Only runs on main branch, not on pull requests
+  ##############################################
+  build-push:
+    name: Build and push image
+    needs: test                              # only runs if test job passes
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'      # only on main branch
+    outputs:
+      image: ${{ steps.build.outputs.image }}
+
+    steps:
+
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}   # the ARN from terraform output
+          aws-region:     ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build, tag, and push Docker image
+        id: build
+        run: |
+          IMAGE="${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPO }}:${{ env.IMAGE_TAG }}"
+          docker build -t $IMAGE .
+          docker push $IMAGE
+          echo "image=$IMAGE" >> $GITHUB_OUTPUT
+
+  ##############################################
+  # JOB 3 — Deploy to ECS
+  ##############################################
+  deploy:
+    name: Deploy to ECS
+    needs: build-push                         # only runs if build-push passes
+    runs-on: ubuntu-latest
+
+    steps:
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region:     ${{ env.AWS_REGION }}
+
+      - name: Force new ECS deployment
+        run: |
+          aws ecs update-service \
+            --cluster ${{ env.ECS_CLUSTER }} \
+            --service ${{ env.ECS_SERVICE }} \
+            --force-new-deployment
+
+      - name: Wait for ECS service to stabilise
+        run: |
+          aws ecs wait services-stable \
+            --cluster ${{ env.ECS_CLUSTER }} \
+            --services ${{ env.ECS_SERVICE }}
+
+      - name: Print live URL
+        run: |
+          echo "Deployed successfully!"
+          echo "Check your app at the ALB DNS in terraform output"
+
+  ##############################################
+  # JOB 4 — Auto rollback if deploy fails
+  ##############################################
+  rollback:
+    name: Rollback on failure
+    needs: deploy
+    if: failure()                              # only runs if deploy job failed
+    runs-on: ubuntu-latest
+
+    steps:
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region:     ${{ env.AWS_REGION }}
+
+      - name: Rollback to previous task definition
+        run: |
+          PREV_TASK=$(aws ecs describe-services \
+            --cluster ${{ env.ECS_CLUSTER }} \
+            --services ${{ env.ECS_SERVICE }} \
+            --query 'services[0].taskDefinition' \
+            --output text)
+          echo "Rolling back to: $PREV_TASK"
+          aws ecs update-service \
+            --cluster ${{ env.ECS_CLUSTER }} \
+            --service ${{ env.ECS_SERVICE }} \
+            --task-definition $PREV_TASK
+
+      - name: Confirm rollback complete
+        run: echo "Rollback triggered. Check ECS console for status."
